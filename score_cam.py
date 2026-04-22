@@ -154,10 +154,10 @@ class ScoreCAM:
         # 3. De-normalise input so pixel values are back in [0, 1]
         raw_input = input_tensor * self.std + self.mean
 
-        # Bug 2 fix: remove hook before scoring so self.activations stays clean
+        # Remove hook before scoring so self.activations isn't overwritten mid-loop
         self.hook_handle.remove()
 
-        # Bug 1 fix: compute baseline score on a black (zero) image
+        # Baseline: model score for the target class on a fully-black image
         raw_baseline = torch.zeros_like(raw_input)
         baseline_input = (raw_baseline - self.mean) / self.std
         with torch.no_grad():
@@ -173,21 +173,22 @@ class ScoreCAM:
             with torch.no_grad():
                 output = self.model(masked_input)
                 probs  = F.softmax(output, dim=1)
-                # Bug 1 fix: subtract baseline so uninformative masks get ~0 weight
                 scores.append(probs[:, target_class_idx] - base_prob)
 
-        scores = torch.cat(scores)   # (C,)
+        # Clamp to zero: channels that reduce confidence below baseline contribute nothing.
+        # Clamping per-channel (before the sum) prevents negative-score channels from
+        # dragging the entire weighted sum below zero and blanking the heatmap via ReLU.
+        scores = torch.clamp(torch.cat(scores), min=0.0)   # (C,)
 
         # Re-register hook so the engine stays usable for subsequent calls
         self.hook_handle = self.target_layer.register_forward_hook(self._forward_hook)
 
-        # 5. Bug 3 fix: weight original (low-res) activation maps, then upsample the CAM
-        maps_4d = maps.unsqueeze(1)   # (C, 1, H_feat, W_feat)
-        cam = (maps_4d * scores.view(num_channels, 1, 1, 1)).sum(dim=0, keepdim=True)
-        cam = F.relu(cam)
+        # 5. Weighted summation over full-resolution (150×150) upsampled maps.
+        # Using upsampled maps here preserves the spatial detail that would be lost
+        # if the 9×9 feature maps were weighted first and only upsampled at the end.
+        cam = (upsampled_maps * scores.view(num_channels, 1, 1, 1)).sum(dim=0, keepdim=True)
         cam_min, cam_max = cam.min(), cam.max()
         cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
-        cam = F.interpolate(cam, size=(H, W), mode='bilinear', align_corners=False)
 
         return cam.detach().cpu().squeeze().numpy()
 
