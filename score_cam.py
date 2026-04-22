@@ -136,47 +136,58 @@ class ScoreCAM:
         device = input_tensor.device
         self.mean = self.mean.to(device)
         self.std = self.std.to(device)
-        
-        # 1. Trigger Hook to get activations
+
+        # 1. Trigger hook to get activations from the original image
         with torch.no_grad():
             _ = self.model(input_tensor)
-        
-        maps = self.activations[0] 
+
+        maps = self.activations[0]          # (C, H_feat, W_feat)
         num_channels = maps.shape[0]
         B, C, H, W = input_tensor.shape
 
-        # 2. Process Masks
+        # 2. Upsample and normalise activation maps to create per-channel masks
         upsampled_maps = F.interpolate(maps.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False)
         max_v = upsampled_maps.view(num_channels, -1).max(dim=1)[0].view(num_channels, 1, 1, 1)
         min_v = upsampled_maps.view(num_channels, -1).min(dim=1)[0].view(num_channels, 1, 1, 1)
         normalized_masks = (upsampled_maps - min_v) / (max_v - min_v + 1e-8)
 
-        # 3. De-normalize input before masking
+        # 3. De-normalise input so pixel values are back in [0, 1]
         raw_input = input_tensor * self.std + self.mean
 
-        # 4. Scoring Engine
+        # Bug 2 fix: remove hook before scoring so self.activations stays clean
+        self.hook_handle.remove()
+
+        # Bug 1 fix: compute baseline score on a black (zero) image
+        raw_baseline = torch.zeros_like(raw_input)
+        baseline_input = (raw_baseline - self.mean) / self.std
+        with torch.no_grad():
+            base_prob = F.softmax(self.model(baseline_input), dim=1)[0, target_class_idx].item()
+
+        # 4. Scoring engine — measure how much each mask increases target confidence
         scores = []
         for i in range(0, num_channels, self.batch_size):
             batch_masks = normalized_masks[i : i + self.batch_size]
-            
-            # Mask the RAW image (0 stays black)
-            masked_raw = raw_input * batch_masks
-            
-            # RE-NORMALIZE for the model
+            masked_raw   = raw_input * batch_masks
             masked_input = (masked_raw - self.mean) / self.std
-            
+
             with torch.no_grad():
                 output = self.model(masked_input)
-                probs = F.softmax(output, dim=1)
-                scores.append(probs[:, target_class_idx])
+                probs  = F.softmax(output, dim=1)
+                # Bug 1 fix: subtract baseline so uninformative masks get ~0 weight
+                scores.append(probs[:, target_class_idx] - base_prob)
 
-        scores = torch.cat(scores)
+        scores = torch.cat(scores)   # (C,)
 
-        # 5. Weighted Summation
-        cam = (upsampled_maps * scores.view(num_channels, 1, 1, 1)).sum(dim=0, keepdim=True)
+        # Re-register hook so the engine stays usable for subsequent calls
+        self.hook_handle = self.target_layer.register_forward_hook(self._forward_hook)
+
+        # 5. Bug 3 fix: weight original (low-res) activation maps, then upsample the CAM
+        maps_4d = maps.unsqueeze(1)   # (C, 1, H_feat, W_feat)
+        cam = (maps_4d * scores.view(num_channels, 1, 1, 1)).sum(dim=0, keepdim=True)
         cam = F.relu(cam)
         cam_min, cam_max = cam.min(), cam.max()
         cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+        cam = F.interpolate(cam, size=(H, W), mode='bilinear', align_corners=False)
 
         return cam.detach().cpu().squeeze().numpy()
 
@@ -242,7 +253,7 @@ def run_attention_visualization(model, device):
     """
     Main loop: picks a random test image and displays Grad-CAM vs Score-CAM.
     """
-    target_layer = model.features[28]
+    target_layer = model.features[29]   # Bug 4 fix: post-ReLU → non-negative activations
     test_files = glob.glob(os.path.join(CONFIG["DATA_PATH"], "Testing", "*", "*.jpg"))
     sample_path = random.choice(test_files)
     compare_xai_methods(model, sample_path, target_layer, device)
