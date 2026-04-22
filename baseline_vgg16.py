@@ -11,6 +11,7 @@ import json
 import random
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import matplotlib
@@ -42,6 +43,9 @@ CONFIG = {
     "TRAIN_PATH":  "/kaggle/input/datasets/masoudnickparvar/brain-tumor-mri-dataset/Training",
     "TEST_PATH":   "/kaggle/input/datasets/masoudnickparvar/brain-tumor-mri-dataset/Testing",
     "CLASS_NAMES": ["glioma", "meningioma", "notumor", "pituitary"],
+    # "mlp" = original 3-layer classifier on flattened pooled features;
+    # "paper_attention" = GAP + softmax(w) channel weights + linear (paper).
+    "HEAD":        "paper_attention",
 }
 
 
@@ -282,38 +286,94 @@ def verify_splits(dataloaders: dict) -> None:
 # Model Definition
 # =============================================================================
 
-def build_model(num_classes: int = 4):
+
+class PaperChannelAttentionHead(nn.Module):
+    """
+    Channel-level attention after the last conv feature map, as in the paper.
+
+    Given z ∈ R^{B×C×H×W}:
+      1. v_i = (1/HW) Σ_{j,k} z_{b,i,j,k}  (global average pooling per channel)
+      2. α = softmax(w) with trainable w ∈ R^C (same α for all batch elements)
+      3. v_att = v ⊙ α
+      4. logits = W v_att + b  (Linear; softmax is applied in CrossEntropyLoss)
+    """
+
+    def __init__(self, num_channels: int, num_classes: int):
+        super().__init__()
+        self.attention_logits = nn.Parameter(torch.zeros(num_channels))
+        self.fc = nn.Linear(num_channels, num_classes)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: (B, C, H, W)
+        v = z.mean(dim=(2, 3))
+        alpha = F.softmax(self.attention_logits, dim=0)
+        v_att = v * alpha
+        return self.fc(v_att)
+
+
+class VGG16PaperAttention(nn.Module):
+    """VGG16 conv features + paper channel-attention head (no VGG avgpool/classifier)."""
+
+    def __init__(self, num_classes: int = 4, pretrained: bool = True):
+        super().__init__()
+        backbone = models.vgg16(pretrained=pretrained)
+        self.features = backbone.features
+
+        for i in range(20):
+            for p in self.features[i].parameters():
+                p.requires_grad = False
+        for i in range(20, len(self.features)):
+            for p in self.features[i].parameters():
+                p.requires_grad = True
+
+        with torch.no_grad():
+            c = self.features(
+                torch.zeros(1, 3, CONFIG["IMG_SIZE"], CONFIG["IMG_SIZE"])
+            ).shape[1]
+        self.head = PaperChannelAttentionHead(c, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.features(x)
+        return self.head(z)
+
+
+def build_model(num_classes: int = 4, head: Optional[str] = None):
     """
     Build and return a modified VGG16 model for brain tumor classification.
 
     - Loads pretrained VGG16 weights.
     - Freezes conv blocks 1–3 (features[0]–features[19]).
     - Leaves conv blocks 4–5 (features[20]+) unfrozen.
-    - Replaces the classifier head with a 3-layer MLP.
 
     Args:
         num_classes : number of output classes (default: 4)
+        head        : "mlp" (original head) or "paper_attention". If None, uses
+                      CONFIG["HEAD"].
 
     Returns:
-        torch.nn.Module — modified VGG16
+        torch.nn.Module — modified VGG16 or VGG16PaperAttention
 
     Usage (standalone import):
         from baseline_vgg16 import build_model
         model = build_model()
+        model = build_model(head="paper_attention")
     """
+    if head is None:
+        head = CONFIG.get("HEAD", "mlp")
+
+    if head == "paper_attention":
+        return VGG16PaperAttention(num_classes=num_classes, pretrained=True)
+
     model = models.vgg16(pretrained=True)
 
-    # Freeze conv blocks 1–3 (features indices 0–19 inclusive)
     for i in range(20):
         for param in model.features[i].parameters():
             param.requires_grad = False
 
-    # Leave conv blocks 4–5 (features[20]+) unfrozen
     for i in range(20, len(model.features)):
         for param in model.features[i].parameters():
             param.requires_grad = True
 
-    # Replace classifier head
     model.classifier = nn.Sequential(
         nn.Linear(25088, 4096),
         nn.ReLU(inplace=True),
@@ -568,7 +628,10 @@ if __name__ == "__main__":
     dataloaders = get_dataloaders(CONFIG)
     verify_splits(dataloaders)
 
-    model = build_model(num_classes=CONFIG["NUM_CLASSES"]).to(device)
+    model = build_model(
+        num_classes=CONFIG["NUM_CLASSES"],
+        head=CONFIG.get("HEAD", "mlp"),
+    ).to(device)
 
     # TODO: Score-CAM hook point — attach hooks here before or after training
 
